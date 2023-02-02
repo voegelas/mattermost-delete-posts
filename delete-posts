@@ -1,0 +1,249 @@
+#!/usr/bin/perl
+
+# SPDX-License-Identifier: ISC
+
+use 5.016;
+use warnings;
+use utf8;
+
+use DBI                   qw(:sql_types);
+use File::Basename        qw(dirname);
+use File::Spec::Functions qw(catfile);
+
+our $VERSION = '1.000';
+
+my $now = time * 1000;
+
+# Posts that are older than 30 days are soft deleted.
+my $delete_period = $now - 30 * 86400000;
+
+# Soft deleted posts are removed from the database after a week.
+# Set this variable to 0 if you don't want to expunge posts.
+my $expunge_period = $now - 7 * 86400000;
+
+# PostgreSQL settings.
+my $dbname   = 'mattermost_production';
+my $host     = '/var/opt/gitlab/postgresql';
+my $username = 'gitlab_mattermost';
+
+# Mattermost file storage.
+my $datadir = '/var/opt/gitlab/mattermost/data';
+
+sub is_folder_empty {
+    my $dir = shift;
+
+    opendir(my $dh, $dir) or die "Not a directory: $dir";
+    return scalar(grep { $_ ne "." && $_ ne ".." } readdir $dh) == 0;
+}
+
+sub delete_empty_dirs {
+    my ($topdir, $dir) = @_;
+    if ($topdir ne $dir) {
+        if (is_folder_empty($dir)) {
+            my $is_deleted = rmdir $dir;
+            if (!$is_deleted) {
+                say STDERR qq{Cannot delete directory "$dir"};
+            }
+            else {
+                say qq{Deleted directory "$dir"};
+                delete_empty_dirs($topdir, dirname($dir));
+            }
+        }
+    }
+}
+
+sub delete_file {
+    my ($topdir, $path) = @_;
+
+    my $is_deleted = 0;
+    my $file       = catfile($topdir, $path);
+    if (!-f $file) {
+        $is_deleted = 1;
+    }
+    else {
+        $is_deleted = unlink $file;
+        if (!$is_deleted) {
+            say STDERR qq{Cannot delete file "$file"};
+        }
+        else {
+            say qq{Deleted file "$file"};
+            delete_empty_dirs($topdir, dirname($file));
+        }
+    }
+    return $is_deleted;
+}
+
+my $dbh = DBI->connect("dbi:Pg:dbname=$dbname;host=$host",
+    $username, q{}, {AutoCommit => 0, RaiseError => 1});
+
+# This SQL statement soft deletes old posts by setting the DeleteAt column.
+# Pinned posts aren't deleted.
+#
+# Customize this statement if you would like to change the expiration times or
+# exclude some channels.  Get the ChannelId from the user interface.
+my $update_posts_sth = $dbh->prepare(<<~'SQL');
+    UPDATE Posts
+    SET DeleteAt=$1
+    WHERE NOT IsPinned AND DeleteAt = 0 AND CreateAt < $2;
+    SQL
+$update_posts_sth->bind_param(1, $now,           SQL_BIGINT);
+$update_posts_sth->bind_param(2, $delete_period, SQL_BIGINT);
+
+# This SQL statement soft deletes all file infos that belong to soft deleted
+# posts.
+my $update_fileinfo_sth = $dbh->prepare(<<~'SQL');
+    UPDATE FileInfo AS f
+    SET DeleteAt = p.DeleteAt
+    FROM Posts AS p
+    WHERE f.DeleteAt = 0 AND f.PostId = p.Id AND p.DeleteAt > 0
+    SQL
+
+# This SQL statement queries soft deleted file infos for associated files.
+my $select_fileinfo_sth = $dbh->prepare(<<~'SQL');
+    SELECT f.Id, f.Path, f.ThumbnailPath, f.PreviewPath
+    FROM FileInfo AS f
+    LEFT JOIN Posts AS p ON f.PostId = p.Id
+    WHERE (f.DeleteAt > 0 AND f.DeleteAt <= $1) OR
+          (p.DeleteAt > 0 AND p.DeleteAt <= $1)
+    SQL
+$select_fileinfo_sth->bind_param(1, $expunge_period, SQL_BIGINT);
+
+# File infos are expunged with this SQL statement after the associated files
+# have been removed from the file system.
+my $delete_fileinfo_sth = $dbh->prepare(<<~'SQL');
+    DELETE FROM FileInfo WHERE Id = $1
+    SQL
+
+# This SQL statement expunges soft deleted posts.
+my $delete_posts_sth = $dbh->prepare(<<~'SQL');
+    DELETE FROM Posts WHERE DeleteAt > 0 AND DeleteAt <= $1
+    SQL
+$delete_posts_sth->bind_param(1, $expunge_period, SQL_BIGINT);
+
+# Soft delete old posts and file infos.
+my $posts_count = $update_posts_sth->execute;
+if ($posts_count > 0) {
+    say "Soft deleted $posts_count post(s)";
+}
+
+my $fileinfo_count = $update_fileinfo_sth->execute;
+if ($fileinfo_count > 0) {
+    say "Soft deleted $fileinfo_count file info(s)";
+}
+
+# Remove files and posts that have reached the expiration time.
+if ($expunge_period > 0) {
+    $fileinfo_count = 0;
+    $select_fileinfo_sth->execute;
+    while (my $next = $select_fileinfo_sth->fetchrow_arrayref) {
+        my ($id, @paths) = @{$next};
+        my $is_deleted = 1;
+        for my $path (grep {$_} @paths) {
+            if (!delete_file($datadir, $path)) {
+                $is_deleted = 0;
+            }
+        }
+        if ($is_deleted) {
+            $fileinfo_count += $delete_fileinfo_sth->execute($id);
+        }
+    }
+
+    if ($fileinfo_count > 0) {
+        say "Expunged $fileinfo_count file info(s)";
+    }
+
+    $posts_count = $delete_posts_sth->execute;
+    if ($posts_count > 0) {
+        say "Expunged $posts_count post(s)";
+    }
+}
+
+$dbh->commit;
+
+$dbh->disconnect;
+__END__
+
+=encoding UTF-8
+
+=head1 NAME
+
+delete-posts - Delete old posts from GitLab Mattermost
+
+=head1 VERSION
+
+version 1.000
+
+=head1 USAGE
+
+  # delete-posts.timer
+  [Unit]
+  Description=Delete old posts from GitLab Mattermost
+
+  [Timer]
+  OnCalendar=Sun *-*-* 5:52
+
+  [Install]
+  WantedBy=timers.target
+
+  # delete-posts.service
+  [Unit]
+  Description=Delete old posts from GitLab Mattermost
+
+  [Service]
+  Type=oneshot
+  ExecStart=/usr/local/sbin/delete-posts
+  User=mattermost
+  Nice=9
+  IOSchedulingClass=idle
+
+=head1 DESCRIPTION
+
+This script deletes old posts from all channels in GitLab Mattermost.  Pinned
+posts are excluded.  Posts are first soft deleted and later removed from the
+database.
+
+The script and the systemd unit files need to be installed on a GitLab server
+and run as user mattermost.
+
+=head1 CONFIGURATION
+
+Edit the script's variables and SQL statements.
+
+=head1 DEPENDENCIES
+
+Requires DBD::Pg.  Install the package libdbd-pg-perl on Debian-based systems
+and the package perl-DBD-Pg on RPM-based systems.
+
+=head1 INCOMPATIBILITIES
+
+None.
+
+=head1 BUGS AND LIMITATIONS
+
+Deleting posts from the Mattermost database is officially not supported, but
+the Team Edition doesn't provide retention policies.
+
+Reload the Mattermost web interface with Ctrl + Shift + R in order to reflect
+the changes.
+
+=head1 AUTHOR
+
+Andreas Vögele E<lt>andreas@andreasvoegele.comE<gt>
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright (C) 2023 Andreas Vögele
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+=cut

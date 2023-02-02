@@ -1,0 +1,9 @@
+[Unit]
+Description=Delete old posts from GitLab Mattermost
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/delete-posts
+User=mattermost
+Nice=9
+IOSchedulingClass=idle

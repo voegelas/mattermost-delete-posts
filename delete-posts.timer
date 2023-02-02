@@ -1,0 +1,8 @@
+[Unit]
+Description=Delete old posts from GitLab Mattermost
+
+[Timer]
+OnCalendar=Sun *-*-* 5:52
+
+[Install]
+WantedBy=timers.target
