@@ -14,6 +14,9 @@ our $VERSION = '1.000';
 
 my $now = time * 1000;
 
+# Always keep the last 1000 posts.
+my $posts_limit = 1000;
+
 # Posts that are older than 30 days are soft deleted.
 my $delete_period = $now - 30 * 86400000;
 
@@ -82,12 +85,20 @@ my $dbh = DBI->connect("dbi:Pg:dbname=$dbname;host=$host",
 # Customize this statement if you would like to change the expiration times or
 # exclude some channels.  Get the ChannelId from the user interface.
 my $update_posts_sth = $dbh->prepare(<<~'SQL');
-    UPDATE Posts
+    UPDATE Posts AS p1
     SET DeleteAt=$1
-    WHERE NOT IsPinned AND DeleteAt = 0 AND CreateAt < $2;
+    WHERE NOT IsPinned AND DeleteAt = 0 AND CreateAt < $2
+    AND Id NOT IN (
+        SELECT Id
+        FROM Posts AS p2
+        WHERE p2.ChannelId = p1.ChannelId AND DeleteAt = 0
+        ORDER BY CreateAt DESC
+        LIMIT $3
+    );
     SQL
 $update_posts_sth->bind_param(1, $now,           SQL_BIGINT);
 $update_posts_sth->bind_param(2, $delete_period, SQL_BIGINT);
+$update_posts_sth->bind_param(3, $posts_limit,   SQL_INTEGER);
 
 # This SQL statement soft deletes all file infos that belong to soft deleted
 # posts.
