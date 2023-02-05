@@ -32,50 +32,6 @@ my $username = 'gitlab_mattermost';
 # Mattermost file storage.
 my $datadir = '/var/opt/gitlab/mattermost/data';
 
-sub is_folder_empty {
-    my $dir = shift;
-
-    opendir(my $dh, $dir) or die "Not a directory: $dir";
-    return scalar(grep { $_ ne "." && $_ ne ".." } readdir $dh) == 0;
-}
-
-sub delete_empty_dirs {
-    my ($topdir, $dir) = @_;
-    if ($topdir ne $dir) {
-        if (is_folder_empty($dir)) {
-            my $is_deleted = rmdir $dir;
-            if (!$is_deleted) {
-                say STDERR qq{Cannot delete directory "$dir"};
-            }
-            else {
-                say qq{Deleted directory "$dir"};
-                delete_empty_dirs($topdir, dirname($dir));
-            }
-        }
-    }
-}
-
-sub delete_file {
-    my ($topdir, $path) = @_;
-
-    my $is_deleted = 0;
-    my $file       = catfile($topdir, $path);
-    if (!-f $file) {
-        $is_deleted = 1;
-    }
-    else {
-        $is_deleted = unlink $file;
-        if (!$is_deleted) {
-            say STDERR qq{Cannot delete file "$file"};
-        }
-        else {
-            say qq{Deleted file "$file"};
-            delete_empty_dirs($topdir, dirname($file));
-        }
-    }
-    return $is_deleted;
-}
-
 my $dbh = DBI->connect("dbi:Pg:dbname=$dbname;host=$host",
     $username, q{}, {AutoCommit => 0, RaiseError => 1});
 
@@ -172,6 +128,50 @@ if ($expunge_period > 0) {
 $dbh->commit;
 
 $dbh->disconnect;
+
+sub is_folder_empty {
+    my $dir = shift;
+
+    opendir(my $dh, $dir) or die "Not a directory: $dir";
+    return scalar(grep { $_ ne "." && $_ ne ".." } readdir $dh) == 0;
+}
+
+sub delete_empty_dirs {
+    my ($topdir, $dir) = @_;
+    if ($topdir ne $dir) {
+        if (is_folder_empty($dir)) {
+            my $is_deleted = rmdir $dir;
+            if (!$is_deleted) {
+                say STDERR qq{Cannot delete directory "$dir"};
+            }
+            else {
+                say qq{Deleted directory "$dir"};
+                delete_empty_dirs($topdir, dirname($dir));
+            }
+        }
+    }
+}
+
+sub delete_file {
+    my ($topdir, $path) = @_;
+
+    my $is_deleted = 0;
+    my $file       = catfile($topdir, $path);
+    if (!-f $file) {
+        $is_deleted = 1;
+    }
+    else {
+        $is_deleted = unlink $file;
+        if (!$is_deleted) {
+            say STDERR qq{Cannot delete file "$file"};
+        }
+        else {
+            say qq{Deleted file "$file"};
+            delete_empty_dirs($topdir, dirname($file));
+        }
+    }
+    return $is_deleted;
+}
 __END__
 
 =encoding UTF-8
